@@ -118,8 +118,8 @@ group to use the CPU.
 | --- | --- | --- |
 | Normal minimize | CPU layered window | Faster in matched minimize tests and avoids native taskbar-state flicker. |
 | Large Hexagon minimize, at least 3 million source pixels | D3D11 + layered window when warm and compatible; otherwise CPU | Avoids the high full-resolution CPU frame cost without using a DirectComposition minimize handoff. |
-| Normal restore | D3D11 + DirectComposition when warm and compatible; otherwise CPU | Avoids layered-window synchronization and is consistently faster. Show Desktop uses either the classic sequential mode or Windows' native batch animation, depending on its setting. |
-| Animated launch | D3D11 + DirectComposition when warm and compatible; otherwise CPU | Reuses the restore path without making a cold GPU startup block the first window. |
+| Normal restore | D3D11 + DirectComposition when warm and compatible; otherwise CPU | The optional source-pixel threshold selects CPU for smaller windows on systems with high composition pacing latency. Show Desktop uses either the classic sequential mode or Windows' native batch animation, depending on its setting. |
+| Animated launch | Same source-pixel threshold and compatible GPU path as restore; otherwise CPU | Reuses the restore path without making a cold GPU startup block the first window. |
 | Close: Thanos or Perlin, 1 px blocks, at least 1.5 million source pixels | D3D11 + layered window when warm and compatible; otherwise CPU | Dense particle work can outweigh the fixed synchronization cost. |
 | Other close workloads | CPU layered window | Faster for ordinary windows, larger blocks, and the other close effects. |
 | Alt+Tab switch | Native DWM thumbnail | Independent of both GPU settings. |
@@ -263,6 +263,14 @@ using overlapping Bézier-rail narrowing and sliding stages.
       in use. Unsupported hardware, Remote Desktop, incompatible processes such as UniKey,
       initialization failure, or device loss falls back to CPU. Disable this setting to force
       CPU for the entire group. See the mod README for the full routing details.
+  - gpu_restore_min_source_pixels: 0
+    $name: Minimum window pixels for GPU restore
+    $description: >-
+      Optional CPU fallback for smaller restore and launch animations while retaining GPU
+      acceleration for larger windows. 0 keeps the default renderer selection. A positive
+      value uses CPU below that source width-times-height, from 1 to 100000000 pixels.
+      For example, 1500000 can help on systems where small GPU restores have uneven pacing;
+      the best value depends on the system and effect. Does not affect minimizing or closing.
   $name: Minimize, restore, and launch
   $description: Configure animations for minimizing, restoring, and opening windows.
 - close:
@@ -1474,6 +1482,7 @@ struct AnimationSettings {
     std::atomic<int> taskbarRevealDurationMs{450};
     std::atomic<bool> useNativeShowDesktopAnimations{false};
     std::atomic<bool> useGpuForMinRestore{true};
+    std::atomic<int> gpuRestoreMinSourcePixels{0};
     std::atomic<bool> useGpuForClose{true};
     std::atomic<bool> performanceTelemetry{false};
 };
@@ -4600,6 +4609,11 @@ void LoadAnimSettings() {
     g_settings.taskbarRevealDurationMs.store(Clamp(Wh_GetIntSetting(L"minimize_restore.unhide_duration_ms"), 0, 5000), std::memory_order_relaxed);
     g_settings.useGpuForMinRestore.store(
         Wh_GetIntSetting(L"minimize_restore.gpu_acceleration") != 0,
+        std::memory_order_relaxed);
+    g_settings.gpuRestoreMinSourcePixels.store(
+        Clamp(Wh_GetIntSetting(
+                  L"minimize_restore.gpu_restore_min_source_pixels"),
+              0, 100000000),
         std::memory_order_relaxed);
     g_settings.useGpuForClose.store(
         Wh_GetIntSetting(L"close.gpu_acceleration") != 0,
@@ -9718,8 +9732,14 @@ static_assert(!ShouldUseHybridGpuClose(CloseEffect::PaintBrush, 1, 3840, 2160));
 // DirectComposition minimize handoff. Readiness and compatibility are still
 // checked below; a cold, disabled or failed GPU retains the CPU fallback.
 static constexpr bool ShouldUseHybridGpuMinRestore(
-    MinRestoreEffect effect, bool rising, int width, int height) {
-    if (rising) return true;
+    MinRestoreEffect effect, bool rising, int width, int height,
+    int restoreMinSourcePixels = 0) {
+    if (rising) {
+        if (restoreMinSourcePixels <= 0) return true;
+        return width > 0 && height > 0 &&
+               static_cast<uint64_t>(width) * static_cast<uint64_t>(height) >=
+                   static_cast<uint64_t>(restoreMinSourcePixels);
+    }
     return effect == MinRestoreEffect::Hexagon && width > 0 && height > 0 &&
            static_cast<uint64_t>(width) * static_cast<uint64_t>(height) >=
                3000000ull;
@@ -9729,6 +9749,14 @@ static_assert(ShouldUseHybridGpuMinRestore(MinRestoreEffect::Hexagon, false, 256
 static_assert(!ShouldUseHybridGpuMinRestore(MinRestoreEffect::Hexagon, false, 1920, 1080));
 static_assert(!ShouldUseHybridGpuMinRestore(MinRestoreEffect::Apparition, false, 3840, 2160));
 static_assert(!ShouldUseHybridGpuMinRestore(MinRestoreEffect::MacOSSuck, false, 3840, 2160));
+static_assert(ShouldUseHybridGpuMinRestore(
+    MinRestoreEffect::Ink, true, 1182, 751));
+static_assert(!ShouldUseHybridGpuMinRestore(
+    MinRestoreEffect::Ink, true, 1182, 751, 1500000));
+static_assert(ShouldUseHybridGpuMinRestore(
+    MinRestoreEffect::Ink, true, 1500, 1000, 1500000));
+static_assert(ShouldUseHybridGpuMinRestore(
+    MinRestoreEffect::Hexagon, false, 3840, 2160, 100000000));
 
 struct GpuRenderService {
     std::mutex mutex;
@@ -15422,7 +15450,9 @@ public:
             data->isClosing
                 ? ShouldUseHybridGpuClose(closeEffect, blockSizeSetting, W, H)
                 : ShouldUseHybridGpuMinRestore(
-                      minRestoreEffect, data->isRising != FALSE, W, H);
+                      minRestoreEffect, data->isRising != FALSE, W, H,
+                      g_settings.gpuRestoreMinSourcePixels.load(
+                          std::memory_order_relaxed));
         const bool gpuToggleEnabled =
             data->isClosing
                 ? g_settings.useGpuForClose.load(std::memory_order_relaxed)
@@ -15443,8 +15473,9 @@ public:
                        blockSizeSetting);
             } else {
                 Wh_Log(L"Animation renderer=CPU hybrid selection hwnd=%p "
-                       L"style=%d standalone minimize",
-                       data->hRealWnd, EffectStyle(minRestoreEffect));
+                       L"style=%d kind=%s source=%dx%d",
+                       data->hRealWnd, EffectStyle(minRestoreEffect),
+                       data->isRising ? L"restore/launch" : L"minimize", W, H);
             }
         }
         if (telemetryEnabled && hybridGpuSelected &&
